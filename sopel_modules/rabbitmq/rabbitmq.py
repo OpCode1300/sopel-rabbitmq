@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import urlparse
-
 import pika
+import yaml
+import gnupg
+
 from sopel import module
 from sopel.config.types import StaticSection, ValidatedAttribute
 
@@ -29,15 +31,36 @@ class rabbitmqSection(StaticSection):
     host = ValidatedAttribute('host')
     """API host address"""
 
+    rabbit_queue_name = ValidatedAttribute('rabbit_queue_name')
+    """RabbitMQ queue name"""
+
+    gpg_home = ValidatedAttribute('gpg_home')
+    """GPG data directory"""
+
+    whitelist_path = ValidatedAttribute('whitelist_path')
+    """GPG whitelist path"""
+
 
 def configure(config):
     config.define_section('rabbitmq', rabbitmqSection)
+
     config.rabbitmq.configure_setting(
-        'username', 'username for rabbitmq API')
+        'username', 'Username for RabbitMQ API')
+
     config.rabbitmq.configure_setting(
         'password', 'API password')
+
     config.rabbitmq.configure_setting(
-        'host', 'hostname or IP of Rabbit server')
+        'host', 'Hostname or IP of Rabbit server')
+
+    config.rabbitmq.configure_setting(
+        'rabbit_queue_name', 'RabbitMQ queue name to monitor')
+
+    config.rabbitmq.configure_setting(
+        'gpg_home', 'GPG data directory')
+
+    config.rabbitmq.configure_setting(
+        'whitelist_path', 'GPG whitelist file path')
 
 
 def setup(bot):
@@ -46,10 +69,22 @@ def setup(bot):
 
 @module.interval(30)
 def process_queue(bot):
-    # Parse CLODUAMQP_URL (fallback to localhost)
+    # RabbitMQ
     username = bot.config.rabbitmq.username
     password = bot.config.rabbitmq.password
     host = bot.config.rabbitmq.host
+    rabbit_queue_name = bot.config.rabbitmq.rabbit_queue_name
+
+    # gpg
+    gpg_home = bot.config.rabbitmq.gpg_home
+    gpg = gnupg.GPG(gnupghome=gpg_home)
+    whitelist_path = bot.config.rabbitmq.whitelist_path
+
+    # Load whitelist
+    whitelist = []
+    with open(whitelist_path, 'r') as ymlfile:
+        for key in yaml.safe_load(ymlfile)['allowed_keys']:
+            whitelist.append(key.replace(' ', ''))
 
     url = "amqp://" + username + ":" + password + "@" + host
     params = pika.URLParameters(url)
@@ -57,13 +92,31 @@ def process_queue(bot):
     connection = pika.BlockingConnection(params)  # Connect to CloudAMQP
     channel = connection.channel()
 
-    while True:
-        method_frame, header_frame, body = channel.basic_get('hello')
-        if method_frame:
-            msg = json.loads(body)
-            bot.msg(msg['channel'], msg['body'])
-            channel.basic_ack(method_frame.delivery_tag)
-        else:
-            # bot.msg("#cfme-bot-test", 'No more messages returned')
-            break
-    connection.close()
+    try:
+        while True:
+            method, properties, body = channel.basic_get(rabbit_queue_name)
+            if method:
+                if properties:
+                    header_channel = properties.headers.get('channel', None)
+                    header_gpg = properties.headers.get('gpg', None)
+                    if header_channel in bot.channels:
+                        if header_gpg:
+                            verified = gpg.verify(body)
+                            message = body.split('-----BEGIN PGP SIGNATURE-----')[0].split('\n\n')[1].rstrip('\n')
+                            if (verified.trust_level is not None and verified.trust_level >= verified.TRUST_FULLY) \
+                                and (verified.fingerprint is not None and verified.fingerprint in whitelist):
+                                    bot.msg(header_channel, message)
+                                    channel.basic_ack(method.delivery_tag)
+                            else:  # verified.trust_level
+                                print('Message did not pass verification.')
+                        else:  # header_gpg
+                            break
+                    else:  # header_channel
+                        print("Bot not in channel: " + str(header_channel))
+                else:  # properties
+                    break
+
+            else:  # method
+                break
+    finally:
+        connection.close()
